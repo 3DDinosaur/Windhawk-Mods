@@ -173,6 +173,8 @@ constexpr double kTwoTapMaxMm = 3.0;
 constexpr DWORD kTwoTapWaitMs = 300;
 // Wheel units per finger mm while scrolling: one notch (120) every 6 mm.
 constexpr double kScrollUnitsPerMm = 20.0;
+// Programs scroll much farther per horizontal wheel unit than per vertical one.
+constexpr double kScrollHorizontalShare = 0.05;
 // Marks the mod's own wheel events, which the wheel block lets through.
 constexpr ULONG_PTR kScrollMark = 0x52484754;
 // After the fingers lift from a scroll moving faster than kInertiaMinSpeed (wheel units/s), it goes on and slows
@@ -680,7 +682,7 @@ void Scroll(double dxMm, double dyMm, double dt) {
         dyMm = 0;
     }
     double sign = g_scrollReverse ? -1 : 1;
-    double ux = -dxMm * kScrollUnitsPerMm * sign;
+    double ux = -dxMm * kScrollUnitsPerMm * kScrollHorizontalShare * sign;
     double uy = dyMm * kScrollUnitsPerMm * sign;
     // The velocity is followed even while the fingers hold still, so that a stop before the lift leaves no
     // inertia.
