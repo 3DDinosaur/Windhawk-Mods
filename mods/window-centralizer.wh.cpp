@@ -7,7 +7,7 @@
 // @github          https://github.com/3DDinosaur
 // @include         *
 // @include         windhawk.exe
-// @compilerOptions -lcomctl32 -lgdi32 -lshell32
+// @compilerOptions -lgdi32 -lshell32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -30,7 +30,7 @@ In every mode the window is kept inside the monitor's work area.
 
 - Only windows with a title bar that are smaller than the **maximum window size** setting (a percentage of the monitor's work area). Large main windows keep their own position.
 - Standard Windows dialogs (Save As, Run, properties pages…) are always centered, whatever their size.
-- Windows of UWP apps such as Calculator and Clock are centered when they open, then left where the user puts them.
+- Windows of UWP apps such as Calculator and Clock are centered on the monitor with the mouse cursor (or on the cursor, in that mode) the first time they get focus, so they may move slightly after appearing. Later they stay where the user puts them.
 - Maximized, minimized, tool, layered and untitled windows, splash screens, menus, tooltips and shell surfaces (taskbar, Start, search) are never moved. Windows that an animation mod fades in are still centered.
 - A window that is hidden and shown again (for example a Find dialog that is reopened) is centered again.
 - Some programs move their window again right after showing it, to restore a saved position. For a moment after a window is centered, such moves by the window's own program are sent back to the center. Moves by other tools, and the user's own dragging, are left alone.
@@ -39,7 +39,7 @@ In every mode the window is kept inside the monitor's work area.
 
 Press **Win+Alt+I** while a window is active to stop centering that kind of window, and press it again on it to undo. A short notification confirms the change.
 
-A rule covers the kind of window, not the document or page it shows: ignoring one Chrome window ignores every Chrome window, and ignoring the Properties of one folder ignores Properties for every folder. Standard dialogs, which all share one window class, are told apart by the kinds of controls they contain, so Find and Save As stay separate. Dialogs of the same program built from the same kinds of controls, such as simple message boxes, are treated as one kind. All UWP apps share one host process and window class, so ignoring one UWP app ignores them all.
+A rule covers the kind of window, not the document or page it shows: ignoring one Chrome window ignores every Chrome window, and ignoring the Properties of one folder ignores Properties for every folder. Standard dialogs, which all share one window class, are told apart by the kinds of controls they contain, so Find and Save As stay separate. Dialogs of the same program built from the same kinds of controls, such as simple message boxes, are treated as one kind. UWP apps are told apart by the app's own program, so each one can be ignored separately.
 
 The **Ignored windows** list opens with **Win+Ctrl+Alt+I**, and entries can be removed there. If its hotkey is empty or taken by another program, that window opens whenever the mod settings are saved.
 
@@ -79,7 +79,6 @@ Don't use this mod together with [Center New Windows](https://github.com/ramenso
 // ==/WindhawkModSettings==
 
 #include <windows.h>
-#include <commctrl.h>
 #include <windhawk_utils.h>
 #include <atomic>
 #include <stdio.h>
@@ -246,7 +245,8 @@ bool RuleMatches(const wchar_t* rule, size_t ruleLen, WindowKey& key) {
     return !*sig || wcscmp(sig, SignatureOf(key)) == 0;
 }
 
-bool IsIgnored(HWND hwnd, const wchar_t* cls) {
+/// Whether a rule matches the window, as a window of the given process (process name, class, dialog signature).
+bool IsIgnoredAs(const wchar_t* process, HWND hwnd, const wchar_t* cls) {
     int version = Wh_GetIntValue(L"ignoredVersion", 0);
     AcquireSRWLockExclusive(&g_ignore.lock);
     if (version != g_ignore.version) {
@@ -261,7 +261,7 @@ bool IsIgnored(HWND hwnd, const wchar_t* cls) {
     wchar_t kind[256];
     wcscpy_s(kind, cls);
     NormalizeClass(kind);
-    WindowKey key = {hwnd, g_processName, kind, L"", false};
+    WindowKey key = {hwnd, process, kind, L"", false};
     bool ignored = false;
     for (const wchar_t* line = g_ignore.text; line && *line && !ignored;) {
         const wchar_t* end = wcschr(line, L'\n');
@@ -271,6 +271,10 @@ bool IsIgnored(HWND hwnd, const wchar_t* cls) {
     }
     ReleaseSRWLockExclusive(&g_ignore.lock);
     return ignored;
+}
+
+bool IsIgnored(HWND hwnd, const wchar_t* cls) {
+    return IsIgnoredAs(g_processName, hwnd, cls);
 }
 
 // ───────────── Which windows to center ─────────────
@@ -295,6 +299,7 @@ bool IsIgnoredClass(const wchar_t* cls) {
     static const wchar_t* const kExact[] = {
         L"Ghost", L"#32768", L"Shell_TrayWnd", L"TrayNotifyWnd", L"Progman", L"WorkerW",
         L"Windows.UI.Core.CoreWindow",
+        L"ApplicationFrameWindow",  // UWP frames: centered by the tool process, see "UWP app windows"
     };
     for (const wchar_t* name : kExact)
         if (_wcsicmp(cls, name) == 0)
@@ -540,82 +545,9 @@ void CenterNow(HWND hwnd) {
     RememberCenter(hwnd, c);
 }
 
-// ───────────── UWP app windows ─────────────
-//
-// Calculator, Clock and other UWP apps live in an ApplicationFrameWindow of ApplicationFrameHost.exe.
-// It is shown cloaked, untitled and at a placeholder size, so the show hooks skip it. Its real size and
-// position arrive later through a call none of the hooks see, so the frame is subclassed when shown and
-// centered in its own WM_WINDOWPOSCHANGING, which every move goes through whoever makes it.
-
-SRWLOCK g_uwpLock = SRWLOCK_INIT;
-HWND g_uwpFrames[16];  // frames currently subclassed, unsubclassed in Wh_ModUninit
-
 bool IsUwpFrame(HWND hwnd) {
     wchar_t cls[32];
     return GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) && wcscmp(cls, L"ApplicationFrameWindow") == 0;
-}
-
-/// Removes hwnd from g_uwpFrames. False if it wasn't there.
-bool UntrackUwpFrame(HWND hwnd) {
-    bool found = false;
-    AcquireSRWLockExclusive(&g_uwpLock);
-    for (HWND& frame : g_uwpFrames) {
-        if (frame == hwnd) {
-            frame = nullptr;
-            found = true;
-        }
-    }
-    ReleaseSRWLockExclusive(&g_uwpLock);
-    return found;
-}
-
-LRESULT CALLBACK UwpFrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, DWORD_PTR) {
-    if (msg == WM_NCDESTROY) {
-        if (UntrackUwpFrame(hwnd))
-            WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, UwpFrameProc);
-        return DefSubclassProc(hwnd, msg, wParam, lParam);
-    }
-    if (msg != WM_WINDOWPOSCHANGING)
-        return DefSubclassProc(hwnd, msg, wParam, lParam);
-
-    auto* pos = (WINDOWPOS*)lParam;
-    RECT rc;
-    GetWindowRect(hwnd, &rc);
-    int w = (pos->flags & SWP_NOSIZE) ? rc.right - rc.left : pos->cx;
-    int h = (pos->flags & SWP_NOSIZE) ? rc.bottom - rc.top : pos->cy;
-    // The placeholder size the frame is shown with (about 178×39) isn't the app's; wait for the real one.
-    if ((pos->flags & SWP_NOMOVE) || h < 100)
-        return DefSubclassProc(hwnd, msg, wParam, lParam);
-    RECT proposed = {pos->x, pos->y, pos->x + w, pos->y + h};
-    int x, y;
-    if (!IsIgnored(hwnd, L"ApplicationFrameWindow") && ComputeTarget(hwnd, proposed, &x, &y)) {
-        pos->x = x;
-        pos->y = y;
-    }
-    LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
-    // Only the first real position is replaced; later moves are the user's.
-    if (UntrackUwpFrame(hwnd))
-        WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, UwpFrameProc);
-    return result;
-}
-
-void SubclassUwpFrame(HWND hwnd) {
-    if (_wcsicmp(g_processName, L"ApplicationFrameHost.exe") != 0 || !IsUwpFrame(hwnd))
-        return;
-    AcquireSRWLockExclusive(&g_uwpLock);
-    HWND* slot = nullptr;
-    bool tracked = false;
-    for (HWND& frame : g_uwpFrames) {
-        if (frame == hwnd)
-            tracked = true;
-        else if (!frame && !slot)
-            slot = &frame;
-    }
-    if (!tracked && slot)
-        *slot = hwnd;
-    ReleaseSRWLockExclusive(&g_uwpLock);
-    if (!tracked && slot && !WindhawkUtils::SetWindowSubclassFromAnyThread(hwnd, UwpFrameProc, 0))
-        UntrackUwpFrame(hwnd);
 }
 
 bool IsShowCommand(int cmd) {
@@ -631,10 +563,8 @@ bool IsShowCommand(int cmd) {
 using NtUserShowWindow_t = BOOL(WINAPI*)(HWND, int);
 NtUserShowWindow_t NtUserShowWindow_Original;
 BOOL WINAPI NtUserShowWindow_Hook(HWND hwnd, int cmd) {
-    if (hwnd && IsShowCommand(cmd) && !IsWindowVisible(hwnd)) {
+    if (hwnd && IsShowCommand(cmd) && !IsWindowVisible(hwnd))
         CenterNow(hwnd);
-        SubclassUwpFrame(hwnd);
-    }
     return NtUserShowWindow_Original(hwnd, cmd);
 }
 
@@ -866,6 +796,148 @@ void ProcessNameOf(HWND hwnd, wchar_t* name, DWORD chars) {
     CloseHandle(proc);
 }
 
+// ── UWP app windows ──
+//
+// Every UWP app (Calculator, Clock…) lives in an ApplicationFrameWindow of ApplicationFrameHost.exe, so
+// process and class can't tell the apps apart. The app's own process, which owns the CoreWindow inside
+// the frame, can, but that window only exists once the app has started, after the frame is shown. So
+// UWP frames are centered from this process, the first time they get focus, and may move visibly.
+
+HWINEVENTHOOK g_foregroundHook;
+HWND g_uwpSeen[64];  // frames already handled: centered once, or open before the tool started
+struct UwpRetry {
+    HWND frame;
+    int tries;
+};
+UwpRetry g_uwpRetries[8];
+enum { TIMER_UWP_RETRY = 2 };
+
+struct CoreWindowSearch {
+    HWND found;
+};
+
+BOOL CALLBACK FindCoreWindow(HWND hwnd, LPARAM param) {
+    wchar_t cls[64];
+    if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) && wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0) {
+        ((CoreWindowSearch*)param)->found = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/// File name of the app hosted in a UWP frame, such as CalculatorApp.exe. False if the app hasn't attached yet.
+bool UwpAppProcess(HWND frame, wchar_t* name, DWORD chars) {
+    CoreWindowSearch search = {nullptr};
+    EnumChildWindows(frame, FindCoreWindow, (LPARAM)&search);
+    if (!search.found)
+        return false;
+    ProcessNameOf(search.found, name, chars);
+    return name[0] != L'\0';
+}
+
+bool UwpSeen(HWND frame) {
+    for (HWND h : g_uwpSeen)
+        if (h == frame)
+            return true;
+    return false;
+}
+
+void MarkUwpSeen(HWND frame) {
+    static int next;
+    for (HWND& h : g_uwpSeen) {
+        if (!h || !IsWindow(h)) {
+            h = frame;
+            return;
+        }
+    }
+    g_uwpSeen[next++ % ARRAYSIZE(g_uwpSeen)] = frame;
+}
+
+/// Centers a UWP frame once. False if it isn't ready yet (placeholder size, or the app not attached).
+bool TryCenterUwpFrame(HWND frame) {
+    if (!IsWindow(frame))
+        return true;
+    if (IsIconic(frame) || IsZoomed(frame)) {
+        MarkUwpSeen(frame);
+        return true;
+    }
+    RECT rc;
+    GetWindowRect(frame, &rc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    // The frame is shown at a placeholder size (about 178×39) before it gets the app's.
+    if (h < 100)
+        return false;
+    wchar_t app[MAX_PATH];
+    if (!UwpAppProcess(frame, app, ARRAYSIZE(app)))
+        return false;
+    MarkUwpSeen(frame);
+    if (IsIgnoredAs(app, frame, L"ApplicationFrameWindow"))
+        return true;
+    POINT c;
+    if (g_mode == MODE_MOUSE)
+        GetCursorPos(&c);
+    else
+        c = CursorMonitorCenter();
+    int x, y;
+    if (PlaceAround(frame, c, w, h, &x, &y) && (x != rc.left || y != rc.top))
+        SetWindowPos(frame, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+    return true;
+}
+
+void QueueUwpRetry(HWND frame) {
+    UwpRetry* slot = nullptr;
+    for (UwpRetry& r : g_uwpRetries) {
+        if (r.frame == frame)
+            return;
+        if (!r.frame && !slot)
+            slot = &r;
+    }
+    if (!slot)
+        return;
+    *slot = {frame, 0};
+    SetTimer(g_hwndHost, TIMER_UWP_RETRY, 100, nullptr);
+}
+
+void RunUwpRetries() {
+    bool pending = false;
+    for (UwpRetry& r : g_uwpRetries) {
+        if (!r.frame)
+            continue;
+        if (TryCenterUwpFrame(r.frame) || ++r.tries >= 20)
+            r = {};
+        else
+            pending = true;
+    }
+    if (!pending)
+        KillTimer(g_hwndHost, TIMER_UWP_RETRY);
+}
+
+void CALLBACK ForegroundProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG idObject, LONG, DWORD, DWORD) {
+    if (idObject != OBJID_WINDOW || !hwnd || !IsUwpFrame(hwnd) || UwpSeen(hwnd))
+        return;
+    if (!TryCenterUwpFrame(hwnd))
+        QueueUwpRetry(hwnd);
+}
+
+BOOL CALLBACK MarkOpenUwpFrame(HWND hwnd, LPARAM) {
+    if (IsUwpFrame(hwnd))
+        MarkUwpSeen(hwnd);
+    return TRUE;
+}
+
+void StartUwpCentering() {
+    // Apps already open when the tool starts keep their place.
+    EnumWindows(MarkOpenUwpFrame, 0);
+    g_foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, ForegroundProc, 0, 0,
+                                       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+}
+
+void StopUwpCentering() {
+    if (g_foregroundHook)
+        UnhookWinEvent(g_foregroundHook);
+    g_foregroundHook = nullptr;
+}
+
 // ── Notification ──
 
 void ShowToast(const wchar_t* title, const wchar_t* detail);
@@ -877,6 +949,9 @@ void ToggleIgnoreActive() {
     wchar_t process[MAX_PATH], cls[256], title[512];
     ProcessNameOf(hwnd, process, ARRAYSIZE(process));
     GetClassNameW(hwnd, cls, ARRAYSIZE(cls));
+    // A UWP frame's rule names the hosted app, so each app can be ignored on its own.
+    if (IsUwpFrame(hwnd))
+        UwpAppProcess(hwnd, process, ARRAYSIZE(process));
     NormalizeClass(cls);
     TitleOf(hwnd, title, ARRAYSIZE(title));
     if (!process[0])
@@ -1187,6 +1262,7 @@ void OpenList() {
 // ── Host window and thread ──
 
 void ApplyHostSettings(bool fromSettingsChange) {
+    LoadCenteringSettings();  // the mode and size threshold drive UWP centering here
     LoadHotkeySettings();
     RegisterHotkeyText(HK_IGNORE, g_ignoreHotkey);
     g_listHotkeyActive = RegisterHotkeyText(HK_LIST, g_listHotkey);
@@ -1206,6 +1282,10 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_APP_RELOAD:
             ApplyHostSettings(true);
+            return 0;
+        case WM_TIMER:
+            if (wParam == TIMER_UWP_RETRY)
+                RunUwpRetries();
             return 0;
         case WM_DESTROY:
             g_hwndHost = nullptr;
@@ -1254,7 +1334,9 @@ DWORD WINAPI HostThread(void*) {
         g_hwndHost = CreateWindowExW(0, kHostClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
         if (g_hwndHost) {
             ApplyHostSettings(false);
+            StartUwpCentering();
             RunHostLoop();
+            StopUwpCentering();
         }
     } else {
         Wh_Log(L"RegisterClassExW failed: %u", GetLastError());
@@ -1547,13 +1629,6 @@ void Wh_ModUninit() {
         ToolMod_Uninit();
         return;
     }
-    HWND frames[ARRAYSIZE(g_uwpFrames)];
-    AcquireSRWLockExclusive(&g_uwpLock);
-    memcpy(frames, g_uwpFrames, sizeof(frames));
-    ReleaseSRWLockExclusive(&g_uwpLock);
-    for (HWND frame : frames)
-        if (frame && IsWindow(frame))
-            WindhawkUtils::RemoveWindowSubclassFromAnyThread(frame, UwpFrameProc);
     if (g_ignore.text)
         HeapFree(GetProcessHeap(), 0, g_ignore.text);
     g_ignore.text = nullptr;
